@@ -63,7 +63,7 @@ def parse_clashperk_embed(embed_text: str):
     """
     ranked_players = []
     for raw_line in (embed_text or "").splitlines():
-        print("[DEBUG RAW ROW]", repr(raw_line))
+######        print("[DEBUG RAW ROW]", repr(raw_line))     # ONLY ENABLE WHEN DEBUGGING PARSING
         #line = raw_line.strip().strip("`| ")
         # Remove invisible formatting characters and Markdown table backticks.
         line = "".join(
