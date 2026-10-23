@@ -39,7 +39,7 @@ def load_giveaway_state():
     except (FileNotFoundError, json.JSONDecodeError):
         return None
 
-# Add your 20 clan tags here
+# The 18 clan tags included in this giveaway
 CLAN_TAGS = [
     "#RCUPQPP2", "#L0JQVCYL", "#2Y90Q2GJV", "#28U9PG0GL",
     "#RVJPRLG8", "#QQ0YPJ02", "#UVGRR9V2", "#P28Y08G8",
@@ -64,7 +64,13 @@ def parse_clashperk_embed(embed_text: str):
     ranked_players = []
     for raw_line in (embed_text or "").splitlines():
         print("[DEBUG RAW ROW]", repr(raw_line))
-        line = raw_line.strip().strip("`| ")
+        #line = raw_line.strip().strip("`| ")
+        # Remove invisible formatting characters and Markdown table backticks.
+        line = "".join(
+            ch for ch in raw_line
+            if unicodedata.category(ch) != "Cf"
+        )
+        line = line.replace("`", "").strip().strip("| ")
         if not line:
             continue
 
@@ -105,23 +111,66 @@ def parse_clashperk_embed(embed_text: str):
         unique.setdefault(rank, name)
     return sorted(unique.items())
 
-# 2. Async function to fetch clan members from CoC API
-async def fetch_clan_members(session, clan_tag, headers):
+# 2. Async function to fetch clan members from CoC API, with retries for temporary failures.
+async def fetch_clan_members(session, clan_tag, headers, semaphore):
     formatted_tag = clan_tag.strip().replace('#', '%23')
     url = f"https://api.clashofclans.com/v1/clans/{formatted_tag}/members"
+    max_attempts = 4  # First attempt + up to 3 retries
+    retryable_statuses = {429, 500, 502, 503, 504}
 
-    try:
-        async with session.get(url, headers=headers) as response:
-            if response.status == 200:
-                data = await response.json()
-                # UPDATED: Now returns a dict with both name and donations
-                return [{"name": member["name"], "tag": member["tag"], "donations": member.get("donations", 0)} for member in data.get("items", [])]
-            else:
-                print(f"Failed to fetch clan {clan_tag}: Status {response.status}")
+    for attempt in range(1, max_attempts + 1):
+        try:
+            # Limit simultaneous requests so all 18 clans do not hit the API at once.
+            async with semaphore:
+                async with session.get(url, headers=headers) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        members = [
+                            {
+                                "name": member["name"],
+                                "tag": member["tag"],
+                                "donations": member.get("donations", 0),
+                            }
+                            for member in data.get("items", [])
+                        ]
+                        print(f"[CoC] Fetched {len(members)} members from clan {clan_tag}.")
+                        return members
+
+                    status = response.status
+                    retry_after_header = response.headers.get("Retry-After")
+                    if status not in retryable_statuses:
+                        print(f"[CoC] Permanent failure for clan {clan_tag}: HTTP {status}; not retrying.")
+                        return []
+
+                    if attempt == max_attempts:
+                        print(f"[CoC] Giving up on clan {clan_tag} after {attempt} attempts: HTTP {status}.")
+                        return []
+
+                    try:
+                        retry_after = float(retry_after_header) if retry_after_header else None
+                    except (TypeError, ValueError):
+                        retry_after = None
+
+                    delay = min(retry_after, 30) if retry_after is not None else 2 ** (attempt - 1)
+                    print(
+                        f"[CoC] Temporary HTTP {status} for clan {clan_tag}; "
+                        f"retry {attempt + 1}/{max_attempts} in {delay:.1f}s."
+                    )
+
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            if attempt == max_attempts:
+                print(f"[CoC] Giving up on clan {clan_tag} after {attempt} attempts: {type(exc).__name__}: {exc}")
                 return []
-    except Exception as e:
-        print(f"Error fetching clan {clan_tag}: {e}")
-        return []
+
+            delay = 2 ** (attempt - 1)
+            print(
+                f"[CoC] Temporary network/timeout error for clan {clan_tag} "
+                f"({type(exc).__name__}); retry {attempt + 1}/{max_attempts} in {delay}s."
+            )
+
+        await asyncio.sleep(delay)
+
+    return []
 
 # 3. Initialize Bot
 intents = discord.Intents.default()
@@ -138,7 +187,7 @@ async def on_ready():
     print(f"✅ Bot is online as {bot.user}")
 
 # 5. Define the /giveaway Command
-@bot.tree.command(name="giveaway", description="Fetch all 20 clans and apply ClashPerk activity bonuses!")
+@bot.tree.command(name="giveaway", description="Fetch all 18 clans and apply ClashPerk activity bonuses!")
 # UPDATED: Added min_donations description and changed permissions to allow mods
 @app_commands.describe(
     channel="The channel where ClashPerk posted the activity list", 
@@ -165,13 +214,9 @@ async def giveaway(interaction: discord.Interaction, channel: discord.TextChanne
             )
             combined_text = "\n".join(part for part in [description, field_text] if part)
             looks_like_activity = (
-        """        "most active members" in title.casefold()
+                "most active members" in title.casefold()
                 or "last-on" in combined_text.casefold()
                 or "last on" in combined_text.casefold()
-            )
-        """     "active members" in title.casefold()
-                or "last-on" in combined_text.casefold()
-                or ("score" in combined_text.casefold() and "name" in combined_text.casefold())
             )
             if not looks_like_activity:
                 continue
@@ -190,17 +235,29 @@ async def giveaway(interaction: discord.Interaction, channel: discord.TextChanne
     if not ranked_players:
         print("[ClashPerk] WARNING: No ranked players parsed from the latest 50 messages. Check the candidate embed text layout.")
 
-    # 2. Fetch all ~800 players across 20 clans via CoC API concurrently
+    # 2. Fetch members across the 18 configured clans with limited concurrency and retries
     headers = {
         "Authorization": f"Bearer {COC_API_TOKEN}",
         "Accept": "application/json"
     }
 
-    async with aiohttp.ClientSession() as session:
-        tasks = [fetch_clan_members(session, tag, headers) for tag in CLAN_TAGS]
+    timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=20)
+    connector = aiohttp.TCPConnector(limit=5)
+    semaphore = asyncio.Semaphore(3)  # At most 3 clan requests in flight at once.
+
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        tasks = [fetch_clan_members(session, tag, headers, semaphore) for tag in CLAN_TAGS]
         results = await asyncio.gather(*tasks)
 
-    # UPDATED: Changed flattening logic slightly because we now have dictionaries, not just strings
+    # Summarize coverage so failed clan fetches are visible in the host logs.
+    failed_clans = [tag for tag, members in zip(CLAN_TAGS, results) if not members]
+    print(
+        f"[CoC] Fetch summary: {len(CLAN_TAGS) - len(failed_clans)}/{len(CLAN_TAGS)} clans returned members; "
+        f"{sum(len(clan) for clan in results)} total members fetched."
+    )
+    if failed_clans:
+        print("[CoC] Clans still not fetched after retries: " + ", ".join(failed_clans))
+
     all_members = [member for clan in results for member in clan]
 
     if not all_members:
