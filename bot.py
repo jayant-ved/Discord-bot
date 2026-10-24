@@ -44,7 +44,7 @@ CLAN_TAGS = [
     "#RCUPQPP2", "#L0JQVCYL", "#2Y90Q2GJV", "#28U9PG0GL",
     "#RVJPRLG8", "#QQ0YPJ02", "#UVGRR9V2", "#P28Y08G8",
     "#2VP9PY2U", "#UQ0L8VVJ", "#P9QCJRUQ", "#R92YP9JY",
-    "#8Y82PLV9", "#2YCCGYP2J", "#RQ2RQ2U9", "#CGU9PJJJ",
+    "#8Y82PLV9", "#2YCCGYP2J", "#CYPGJUP8", "#CGU9PJJJ",
     "#Q99CG88V", "#VUU9JJ2V"
 ]
 
@@ -458,5 +458,12 @@ async def reroll(interaction: discord.Interaction):
     embed.set_footer(text="Rerolled from the saved giveaway pool.")
     await interaction.response.send_message(embed=embed)
 
-# 7. Run the bot
-bot.run(DISCORD_TOKEN)
+# 7. Run the bot and load extensions
+async def main():
+    async with bot:
+        await bot.load_extension("banlist")
+        await bot.start(DISCORD_TOKEN)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
